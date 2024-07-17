@@ -12,7 +12,7 @@ import pyspark.sql.connect.proto.expressions_pb2 as spark_exprs_pb2
 import pyspark.sql.connect.proto.relations_pb2 as spark_relations_pb2
 import pyspark.sql.connect.proto.types_pb2 as spark_types_pb2
 from gateway.converter.conversion_options import ConversionOptions
-from gateway.converter.spark_functions import ExtensionFunction, lookup_spark_function
+from gateway.converter.spark_functions import ExtensionFunction, lookup_spark_function, FunctionType
 from gateway.converter.substrait_builder import (
     add_function,
     aggregate_relation,
@@ -447,7 +447,14 @@ class SparkSubstraitConverter:
                 value=cast_operation(original_argument.value, string_type())))
         if function_def.options:
             func.options.extend(function_def.options)
-        return algebra_pb2.Expression(scalar_function=func)
+        match function_def.function_type:
+            case FunctionType.SCALAR:
+                return algebra_pb2.Expression(scalar_function=func)
+            case FunctionType.WINDOW:
+                return algebra_pb2.Expression(window_function=func)
+            case FunctionType.AGGREGATE:
+                # MEGAHACK -- This is incorrect.
+                return algebra_pb2.Expression(scalar_function=func)
 
     def convert_alias_expression(
             self, alias: spark_exprs_pb2.Expression.Alias) -> algebra_pb2.Expression:
@@ -579,6 +586,8 @@ class SparkSubstraitConverter:
                 function = expression.scalar_function
             case 'window_function':
                 function = expression.window_function
+            case 'aggregate_function':
+                function = expression.aggregate_function
             case _:
                 raise NotImplementedError(
                     'only functions of type unresolved function are supported in aggregate '
@@ -589,10 +598,10 @@ class SparkSubstraitConverter:
         func.output_type.CopyFrom(function.output_type)
         return func
 
-    def get_number_of_names(self, type: type_pb2.Type) -> int:
+    def get_number_of_names(self, substrait_type: type_pb2.Type) -> int:
         """Get the number of names consumed used in a Substrait type."""
-        if type.WhichOneof('kind') == 'struct':
-            return sum([self.get_number_of_names(t) for t in type.struct.types]) + 1
+        if substrait_type.WhichOneof('kind') == 'struct':
+            return sum([self.get_number_of_names(t) for t in substrait_type.struct.types]) + 1
         return 1
 
     def get_primary_names(self, schema: type_pb2.NamedStruct) -> list[str]:
