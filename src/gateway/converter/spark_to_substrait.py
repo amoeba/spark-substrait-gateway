@@ -6,6 +6,7 @@ import operator
 import pathlib
 import re
 
+from enum import Enum
 import pyarrow as pa
 import pyspark.sql.connect.proto.base_pb2 as spark_pb2
 import pyspark.sql.connect.proto.expressions_pb2 as spark_exprs_pb2
@@ -52,6 +53,14 @@ from substrait.gen.proto import algebra_pb2, plan_pb2, type_pb2
 from substrait.gen.proto.extensions import extensions_pb2
 
 
+class ExpressionProcessingMode(Enum):
+    """The mode of processing expressions."""
+    NORMAL = 0
+    AGGREGATE_TOP_LEVEL = 1
+    AGGREGATE_NOT_TOP_LEVEL = 2
+    AGGREGATE_UNDER_AGGREGATE = 3
+
+
 # ruff: noqa: RUF005
 class SparkSubstraitConverter:
     """Converts SparkConnect plans to Substrait plans."""
@@ -68,6 +77,13 @@ class SparkSubstraitConverter:
         self._saved_extensions = {}
         self._backend = None
         self._sql_backend = None
+
+        # These are used when processing expressions inside aggregate relations.
+        self._expression_processing_mode = ExpressionProcessingMode.NORMAL
+        self._next_aggregation_reference_id = None
+        self._top_level_projects: list[algebra_pb2.Rel] = []
+        self._aggregations: list[algebra_pb2.AggregateFunction] = []
+        self._under_aggregation_projects: list[algebra_pb2.Rel] = []
 
     def set_backends(self, backend, sql_backend) -> None:
         """Save the backends being used to resolve tables and convert to SQL."""
@@ -410,8 +426,10 @@ class SparkSubstraitConverter:
     def convert_unresolved_function(
             self,
             unresolved_function: spark_exprs_pb2.Expression.UnresolvedFunction
-    ) -> algebra_pb2.Expression:
+    ) -> algebra_pb2.Expression | algebra_pb2.AggregateFunction:
         """Convert a Spark unresolved function into a Substrait scalar function."""
+        parent_processing_mode = self._expression_processing_mode
+        self._expression_processing_mode = ExpressionProcessingMode.AGGREGATE_NOT_TOP_LEVEL
         if unresolved_function.function_name == 'when':
             return self.convert_when_function(unresolved_function)
         if unresolved_function.function_name == 'in':
@@ -453,8 +471,20 @@ class SparkSubstraitConverter:
             case FunctionType.WINDOW:
                 return algebra_pb2.Expression(window_function=func)
             case FunctionType.AGGREGATE:
-                # MEGAHACK -- This is incorrect.
-                return algebra_pb2.Expression(scalar_function=func)
+                if self._expression_processing_mode == ExpressionProcessingMode.NORMAL:
+                    raise ValueError(
+                        f'Aggregate function {unresolved_function.function_name} used in a '
+                        'non-aggregate context.')
+                aggr = algebra_pb2.AggregateFunction(
+                    phase=algebra_pb2.AggregationPhase.AGGREGATION_PHASE_INITIAL_TO_RESULT,
+                    function_reference=function_def.anchor,
+                    output_type=function_def.output_type)
+                if unresolved_function.is_distinct:
+                    aggr.invocation = algebra_pb2.AggregateFunction.AGGREGATION_INVOCATION_DISTINCT
+                aggr.arguments.extend(func.arguments)
+                if function_def.options:
+                    aggr.options.extend(function_def.options)
+                return aggr
 
     def convert_alias_expression(
             self, alias: spark_exprs_pb2.Expression.Alias) -> algebra_pb2.Expression:
@@ -525,6 +555,14 @@ class SparkSubstraitConverter:
                 result = self.convert_unresolved_attribute(expr.unresolved_attribute)
             case 'unresolved_function':
                 result = self.convert_unresolved_function(expr.unresolved_function)
+                if isinstance(result, algebra_pb2.AggregateFunction):
+                    if self._expression_processing_mode == ExpressionProcessingMode.AGGREGATE_TOP_LEVEL:
+                        return result
+                    else:
+                        # MEGAHACK -- Save the function.
+                        result = field_reference(self._next_aggregation_reference_id)
+                        self._next_aggregation_reference_id += 1
+                        return result
             case 'expression_string':
                 raise NotImplementedError(
                     'SQL expressions through selectExpr is not supported')
@@ -563,40 +601,22 @@ class SparkSubstraitConverter:
                     f'Unexpected expression type: {expr.WhichOneof("expr_type")}')
         return result
 
-    def is_distinct(self, expr: spark_exprs_pb2.Expression) -> bool:
-        """Determine if the expression is distinct."""
-        if expr.WhichOneof(
-                'expr_type') == 'unresolved_function' and expr.unresolved_function.is_distinct:
-            return True
-        if expr.WhichOneof('expr_type') == 'alias':
-            return self.is_distinct(expr.alias.expr)
-        return False
-
     def convert_expression_to_aggregate_function(
             self,
             expr: spark_exprs_pb2.Expression) -> algebra_pb2.AggregateFunction:
         """Convert a SparkConnect expression to a Substrait expression."""
-        func = algebra_pb2.AggregateFunction(
-            phase=algebra_pb2.AggregationPhase.AGGREGATION_PHASE_INITIAL_TO_RESULT)
-        if self.is_distinct(expr):
-            func.invocation = algebra_pb2.AggregateFunction.AGGREGATION_INVOCATION_DISTINCT
-        expression = self.convert_expression(expr)
-        match expression.WhichOneof('rex_type'):
-            case 'scalar_function':
-                function = expression.scalar_function
-            case 'window_function':
-                function = expression.window_function
-            case 'aggregate_function':
-                function = expression.aggregate_function
-            case _:
-                raise NotImplementedError(
-                    'only functions of type unresolved function are supported in aggregate '
-                    'relations')
-        func.function_reference = function.function_reference
-        func.arguments.extend(function.arguments)
-        func.options.extend(function.options)
-        func.output_type.CopyFrom(function.output_type)
-        return func
+        self._expression_processing_mode = ExpressionProcessingMode.AGGREGATE_TOP_LEVEL
+        self._next_aggregation_reference_id = 0
+        self._top_level_projects = []
+        self._aggregations = []
+        self._under_aggregation_projects = []
+        result = self.convert_expression(expr)
+        if not isinstance(result, algebra_pb2.AggregateFunction):
+            raise ValueError(
+                f'Scalar function used in an aggregate context.')
+
+        self._expression_processing_mode = ExpressionProcessingMode.NORMAL
+        return result
 
     def get_number_of_names(self, substrait_type: type_pb2.Type) -> int:
         """Get the number of names consumed used in a Substrait type."""
